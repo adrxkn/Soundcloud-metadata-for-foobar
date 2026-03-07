@@ -7,15 +7,6 @@
 // @grant        none
 // ==/UserScript==
 
-/*
-Notes:
-- This adapts your existing script to fetch the progressive mp3 as an ArrayBuffer,
-  fetch the artwork, write ID3 tags with browser-id3-writer, then save with streamSaver.
-- Tradeoff: writing tags requires holding the file in memory (ArrayBuffer). For very large files this may be memory-heavy.
-- If a track only has a HLS/stream (non-progressive) transcoding the script will fall back to your previous behavior (or alert).
-- You can tweak which frames are written. foobar reads standard ID3v2 tags (TIT2, TPE1, TALB, TCON, COMM, APIC) fine.
-*/
-
 (function () {
 	'use strict'
 
