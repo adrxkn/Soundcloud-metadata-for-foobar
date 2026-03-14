@@ -1,260 +1,218 @@
 // ==UserScript==
 // @name         SoundCloud downloader with ID3 metadata (for foobar)
 // @namespace    https://github.com/adrxkn/Soundcloud-metadata-for-foobar
-// @version      0.1
-// @description  Download SoundCloud progressive MP3s and embed ID3 tags (title, artist, cover, tags/genre, comment) so files are foobar-ready. Uses StreamSaver.js for saving and browser-id3-writer to write tags in-browser.
+// @version      0.2
+// @description  Download SoundCloud progressive MP3s and embed ID3 tags
 // @match        https://soundcloud.com/*
-// @grant        none
+// @grant        GM_xmlhttpRequest
+// @connect      api-v2.soundcloud.com
 // ==/UserScript==
 
 (function () {
-	'use strict'
+  'use strict'
 
-	// load StreamSaver if not already present (relies on you having set streamSaver.mitm elsewhere if needed)
-	if (typeof streamSaver === 'undefined') {
-		const s = document.createElement('script')
-		s.src = 'https://unpkg.com/streamsaver@2.0.5/StreamSaver.min.js'
-		document.head.appendChild(s)
-	}
+  function loadScript(src) {
+    return new Promise((resolve, reject) => {
+      if (document.querySelector(`script[src="${src}"]`)) return resolve()
+      const s = document.createElement('script')
+      s.src = src
+      s.onload = resolve
+      s.onerror = reject
+      document.head.appendChild(s)
+    })
+  }
 
-	// load browser-id3-writer
-	async function loadId3Writer() {
-		if (window.ID3Writer) return
-		await new Promise((resolve, reject) => {
-			const s = document.createElement('script')
-			// pinned to a known distribution; adjust version if needed
-			s.src = 'https://cdn.jsdelivr.net/npm/browser-id3-writer@4.0.0/dist/browser-id3-writer.min.js'
-			s.onload = resolve
-			s.onerror = reject
-			document.head.appendChild(s)
-		})
-	}
+  async function loadDeps() {
+    await loadScript('https://cdn.jsdelivr.net/npm/streamsaver@2.0.6/StreamSaver.js')
+    await loadScript('https://cdn.jsdelivr.net/npm/browser-id3-writer@4.4.0/dist/browser-id3-writer.min.js')
+  }
 
-	function hook(obj, name, callback, type) {
-		const fn = obj[name]
-		obj[name] = function (...args) {
-			if (type === 'before') callback.apply(this, args)
-			fn.apply(this, args)
-			if (type === 'after') callback.apply(this, args)
-		}
-		return () => {
-			// restore
-			obj[name] = fn
-		}
-	}
+  function getCleanTrackUrl() {
+    const u = new URL(location.href)
+    return u.origin + u.pathname
+  }
 
-	function sanitizeFilename(name) {
-		// remove characters not allowed on many filesystems
-		return name.replace(/[\/\?<>\\:\*\|":]/g, '').replace(/\s+/g, ' ').trim()
-	}
+  let _clientId = null
 
-	function triggerDownload(url, name) {
-		const a = document.createElement('a')
-		document.body.appendChild(a)
-		a.href = url
-		a.download = name
-		a.click()
-		a.remove()
-	}
+  const origOpen = XMLHttpRequest.prototype.open
+  XMLHttpRequest.prototype.open = function (method, url) {
+    try {
+      const cid = new URL(url, location.href).searchParams.get('client_id')
+      if (cid) _clientId = cid
+    } catch (_) {}
+    return origOpen.apply(this, arguments)
+  }
 
-	const btn = {
-		init() {
-			this.el = document.createElement('button')
-			this.el.textContent = 'Download'
-			this.el.classList.add('sc-button', 'sc-button-medium', 'sc-button-icon', 'sc-button-responsive', 'sc-button-secondary', 'sc-button-download')
-		},
-		cb() {
-			const par = document.querySelector('.sc-button-toolbar .sc-button-group')
-			if (par && this.el.parentElement !== par) par.insertAdjacentElement('beforeend', this.el)
-		},
-		attach() {
-			this.detach()
-			this.observer = new MutationObserver(this.cb.bind(this))
-			this.observer.observe(document.body, { childList: true, subtree: true })
-			this.cb()
-		},
-		detach() {
-			if (this.observer) this.observer.disconnect()
-		}
-	}
-	btn.init()
+  const origFetch = window.fetch
+  window.fetch = function (input, init) {
+    try {
+      const urlStr = typeof input === 'string' ? input : input.url
+      const cid = new URL(urlStr, location.href).searchParams.get('client_id')
+      if (cid) _clientId = cid
+    } catch (_) {}
+    return origFetch.apply(this, arguments)
+  }
 
-	async function getClientId() {
-		return new Promise(resolve => {
-			const restore = hook(
-				XMLHttpRequest.prototype,
-				'open',
-				async (method, url) => {
-					try {
-						const u = new URL(url, document.baseURI)
-						const clientId = u.searchParams.get('client_id')
-						if (!clientId) return
-						console.log('got clientId', clientId)
-						restore()
-						resolve(clientId)
-					} catch (e) {
-						// ignore
-					}
-				},
-				'after'
-			)
-		})
-	}
+  function waitForClientId(timeout = 15000) {
+    return new Promise((resolve, reject) => {
+      if (_clientId) return resolve(_clientId)
+      const start = Date.now()
+      const iv = setInterval(() => {
+        if (_clientId) { clearInterval(iv); resolve(_clientId) }
+        else if (Date.now() - start > timeout) { clearInterval(iv); reject(new Error('Timed out waiting for client_id')) }
+      }, 200)
+    })
+  }
 
-	const clientIdPromise = getClientId()
-	let controller = null
+  function sanitizeFilename(name) {
+    return name.replace(/[\/\?<>\\:\*\|":]/g, '').replace(/\s+/g, ' ').trim()
+  }
 
-	async function arrayBufferFromUrl(url) {
-		// fetch with CORS; SoundCloud allows cross-origin for media/artwork
-		const resp = await fetch(url)
-		if (!resp.ok) throw new Error('Failed to fetch ' + url)
-		return resp.arrayBuffer()
-	}
+  function triggerDownload(url, name) {
+    const a = document.createElement('a')
+    document.body.appendChild(a)
+    a.href = url
+    a.download = name
+    a.click()
+    a.remove()
+  }
 
-	async function load(by) {
-		btn.detach()
-		console.log('load by', by, location.href)
-		if (/^(\/(you|stations|discover|stream|upload|search|settings))/.test(location.pathname)) return
-		const clientId = await clientIdPromise
-		if (!clientId) {
-			console.warn('no client id yet')
-			return
-		}
-		if (controller) {
-			controller.abort()
-			controller = null
-		}
-		controller = new AbortController()
-		const result = await fetch(
-			`https://api-v2.soundcloud.com/resolve?url=${encodeURIComponent(location.href)}&client_id=${clientId}`,
-			{ signal: controller.signal }
-		).then(r => r.json())
-		console.log('result', result)
-		if (result.kind !== 'track') return
+  const btn = {
+    init() {
+      this.el = document.createElement('button')
+      this.el.textContent = '↓ MP3'
+      this.el.classList.add('sc-button', 'sc-button-medium', 'sc-button-responsive', 'sc-button-secondary')
+      this.el.style.cssText = 'font-weight:600;padding:0 12px;'
+    },
+    cb() {
+      const par = document.querySelector('.sc-button-toolbar .sc-button-group')
+      if (par && this.el.parentElement !== par) par.insertAdjacentElement('beforeend', this.el)
+    },
+    attach() {
+      this.detach()
+      this.observer = new MutationObserver(this.cb.bind(this))
+      this.observer.observe(document.body, { childList: true, subtree: true })
+      this.cb()
+    },
+    detach() {
+      if (this.observer) this.observer.disconnect()
+    }
+  }
+  btn.init()
 
-		btn.el.onclick = async () => {
-			try {
-				// prefer progressive transcoding (direct mp3)
-				const progressive = result.media.transcodings.find(t => t.format.protocol === 'progressive')
-				if (progressive) {
-					// If library not loaded, load it
-					await loadId3Writer()
+  let controller = null
 
-					// get the real mp3 URL (SoundCloud gives a redirector)
-					const info = await fetch(progressive.url + `?client_id=${clientId}`).then(r => r.json())
-					const mp3Url = info.url
-					console.log('progressive url', mp3Url)
+  async function load() {
+    btn.detach()
+    if (/^\/(you|stations|discover|stream|upload|search|settings)/.test(location.pathname)) return
 
-					// fetch mp3 arrayBuffer
-					const mp3ArrayBuffer = await arrayBufferFromUrl(mp3Url)
+    let clientId
+    try {
+      clientId = await waitForClientId()
+    } catch (e) {
+      console.warn('[SC-DL] Could not get client_id:', e.message)
+      return
+    }
 
-					// fetch artwork (prefer track artwork, fallback to user avatar)
-					let artworkUrl = result.artwork_url || result.user && result.user.avatar_url
-					if (artworkUrl) {
-						// artwork URLs often include size tokens like "-large" or "-t50x50"
-						// common trick: request a larger size
-						artworkUrl = artworkUrl.replace('-large', '-t500x500').replace('large', 't500x500')
-					}
+    if (controller) { controller.abort(); controller = null }
+    controller = new AbortController()
 
-					let coverArrayBuffer = null
-					try {
-						if (artworkUrl) coverArrayBuffer = await arrayBufferFromUrl(artworkUrl)
-					} catch (e) {
-						console.warn('could not fetch artwork', e)
-						coverArrayBuffer = null
-					}
+    let result
+    try {
+      const cleanUrl = getCleanTrackUrl()
+      result = await fetch(
+        `https://api-v2.soundcloud.com/resolve?url=${encodeURIComponent(cleanUrl)}&client_id=${clientId}`,
+        { signal: controller.signal }
+      ).then(r => {
+        if (!r.ok) throw new Error(`Resolve failed: HTTP ${r.status}`)
+        return r.json()
+      })
+    } catch (e) {
+      if (e.name !== 'AbortError') console.warn('[SC-DL] resolve error:', e.message)
+      return
+    }
 
-					// prepare metadata
-					const artist = (result.user && (result.user.name || result.user.username)) || ''
-					const title = result.title || ''
-					const album = result.publisher_metadata && result.publisher_metadata.release_title ? result.publisher_metadata.release_title : ''
-					const genre = result.genre || ''
-					const tag_list = result.tag_list || ''
-					const comment = `Source: SoundCloud\nURL: ${location.href}`
+    if (result.kind !== 'track') return
 
-					// write ID3 tags using browser-id3-writer
-					// ID3Writer expects a Uint8Array
-					const writer = new window.ID3Writer(new Uint8Array(mp3ArrayBuffer))
+    btn.el.onclick = async () => {
+      btn.el.textContent = 'Loading…'
+      btn.el.disabled = true
+      try {
+        await loadDeps()
 
-					// standard frames
-					writer.setFrame('TIT2', title)
-					writer.setFrame('TPE1', [artist])
-					if (album) writer.setFrame('TALB', album)
-					if (genre) writer.setFrame('TCON', [genre])
+        const progressive = result.media.transcodings.find(t => t.format.protocol === 'progressive')
+        if (!progressive) {
+          alert('No progressive MP3 available for this track.')
+          return
+        }
 
-					// add a comment with the original SoundCloud URL and other info
-					writer.setFrame('COMM', {
-						description: '',
-						text: comment
-					})
+        const info = await fetch(`${progressive.url}?client_id=${clientId}`).then(r => r.json())
+        const mp3Url = info.url
+        console.log('[SC-DL] mp3 url:', mp3Url)
 
-					// write tags/tags-list into a TXXX custom frame for foobar to pick up if needed
-					if (tag_list) {
-						writer.setFrame('TXXX', {
-							description: 'SOUNDCLOUD_TAGS',
-							value: tag_list
-						})
-					}
+        btn.el.textContent = 'Downloading…'
 
-					// embed cover art if available
-					if (coverArrayBuffer) {
-						writer.setFrame('APIC', {
-							type: 3,
-							data: coverArrayBuffer,
-							description: 'cover'
-						})
-					}
+        const mp3ArrayBuffer = await fetch(mp3Url).then(r => {
+          if (!r.ok) throw new Error(`MP3 fetch failed: HTTP ${r.status}`)
+          return r.arrayBuffer()
+        })
 
-					// apply tags
-					writer.addTag()
+        let artworkUrl = (result.artwork_url || (result.user && result.user.avatar_url) || '').replace(/-large|large/g, 't500x500')
+        let coverArrayBuffer = null
+        if (artworkUrl) {
+          try { coverArrayBuffer = await fetch(artworkUrl).then(r => r.arrayBuffer()) }
+          catch (e) { console.warn('[SC-DL] artwork fetch failed', e.message) }
+        }
 
-					// get the tagged blob
-					const taggedBlob = writer.getBlob()
+        const artist = result.user?.name || result.user?.username || ''
+        const title  = result.title || ''
+        const album  = result.publisher_metadata?.release_title || ''
+        const genre  = result.genre || ''
+        const tag_list = result.tag_list || ''
 
-					// filename: "Artist - Title.mp3" sanitized
-					const filename = sanitizeFilename(`${artist} - ${title}.mp3`)
+        const writer = new window.ID3Writer(new Uint8Array(mp3ArrayBuffer))
+        writer.setFrame('TIT2', title)
+        writer.setFrame('TPE1', [artist])
+        if (album)    writer.setFrame('TALB', album)
+        if (genre)    writer.setFrame('TCON', [genre])
+        writer.setFrame('COMM', { description: '', text: `Source: SoundCloud\nURL: ${location.href}` })
+        if (tag_list) writer.setFrame('TXXX', { description: 'SOUNDCLOUD_TAGS', value: tag_list })
+        if (coverArrayBuffer) writer.setFrame('APIC', { type: 3, data: coverArrayBuffer, description: 'cover' })
+        writer.addTag()
 
-					// Use StreamSaver to save file (preserves streaming behaviour for larger result.blobs)
-					if (window.streamSaver && streamSaver.createWriteStream) {
-						try {
-							// streamSaver expects a stream. Convert Blob to stream
-							const fileStream = streamSaver.createWriteStream(filename, { size: taggedBlob.size })
-							if (taggedBlob.stream) {
-								// modern browsers: use blob.stream()
-								const readable = taggedBlob.stream()
-								return readable.pipeTo(fileStream)
-							} else {
-								// fallback: use getReader + writer
-								const reader = new Response(taggedBlob).body.getReader()
-								const writerStream = fileStream.getWriter()
-								const pump = () => reader.read().then(({ done, value }) => done ? writerStream.close() : writerStream.write(value).then(pump))
-								return pump()
-							}
-						} catch (e) {
-							console.warn('StreamSaver saving failed, falling back to link download', e)
-						}
-					}
+        const taggedBlob = writer.getBlob()
+        const filename   = sanitizeFilename(`${artist} - ${title}.mp3`)
 
-					// fallback: create object URL and trigger normal download
-					const url = URL.createObjectURL(taggedBlob)
-					triggerDownload(url, filename)
-					setTimeout(() => URL.revokeObjectURL(url), 60 * 1000)
-					return
-				}
+        if (window.streamSaver?.createWriteStream) {
+          try {
+            const fileStream = streamSaver.createWriteStream(filename, { size: taggedBlob.size })
+            await taggedBlob.stream().pipeTo(fileStream)
+            return
+          } catch (e) {
+            console.warn('[SC-DL] StreamSaver failed, using fallback:', e.message)
+          }
+        }
 
-				// no progressive - fallback to previous streaming method (no tagging)
-				alert('Sorry, downloading this music is currently unsupported (no progressive mp3).')
-			} catch (err) {
-				console.error('download failed', err)
-				alert('Download failed: ' + (err && err.message ? err.message : String(err)))
-			}
-		}
+        const objUrl = URL.createObjectURL(taggedBlob)
+        triggerDownload(objUrl, filename)
+        setTimeout(() => URL.revokeObjectURL(objUrl), 60000)
 
-		btn.attach()
-		console.log('attached (metadata-enabled)')
-	}
+      } catch (err) {
+        const msg = err?.message || err?.toString() || 'Unknown error'
+        console.error('[SC-DL] download failed:', err)
+        alert('Download failed: ' + msg)
+      } finally {
+        btn.el.textContent = '↓ MP3'
+        btn.el.disabled = false
+      }
+    }
 
-	load('init')
-	hook(history, 'pushState', () => load('pushState'), 'after')
-	window.addEventListener('popstate', () => load('popstate'))
+    btn.attach()
+    console.log('[SC-DL] ready')
+  }
+
+  load()
+  const origPushState = history.pushState
+  history.pushState = function (...args) { origPushState.apply(this, args); setTimeout(load, 500) }
+  window.addEventListener('popstate', () => setTimeout(load, 500))
 })()
